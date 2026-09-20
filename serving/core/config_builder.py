@@ -136,8 +136,145 @@ def _resolve_parallelism(instance, model_config):
     return num_npus, tp_size, pp_size, ep_size, dp_group
 
 
-def _resolve_dp_groups(all_instances):
-    """Validate DP groups and compute dp_group_size and ep_total for each instance."""
+def _validate_network_dims(network_dims, instances):
+    """Check an explicitly declared physical topology against the NPU count."""
+    if not isinstance(network_dims, (list, tuple)) or not network_dims:
+        raise TypeError("'network_dims' must be a non-empty list of integers.")
+    dims = []
+    for value in network_dims:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(
+                f"'network_dims' entries must be integers >= 1, got {value!r}."
+            )
+        dims.append(value)
+
+    declared = 1
+    for value in dims:
+        declared *= value
+    actual = sum(
+        inst["num_npus"] if inst.get("pd_type") != "prefill" else inst["num_npus"] * 2
+        for inst in instances
+    )
+    if declared != actual:
+        raise ValueError(
+            f"'network_dims' {dims} describes {declared} NPU(s) but the cluster "
+            f"has {actual}. The declared physical topology must cover every NPU "
+            f"exactly once."
+        )
+    return dims
+
+
+def _npu_ids(instance):
+    """The contiguous ASTRA-Sim NPU id range an instance owns."""
+    start = instance.get("npu_start")
+    span = instance.get("npu_span")
+    if start is None or span is None:
+        raise KeyError(
+            "instance is missing 'npu_start'/'npu_span': NPU ids must be assigned "
+            "before involved_dim can be derived from physical placement."
+        )
+    return list(range(start, start + span))
+
+
+def _decompose(npu_id, dims):
+    """Multi-dim address of an NPU id, innermost dimension first.
+
+    Mirrors ASTRA-Sim's ``MultiDimTopology::translate_address``: for an
+    ``npus_count`` of ``[n0, n1, n2]`` the address is
+    ``(id % n0, (id // n0) % n1, id // (n0 * n1))``.
+    """
+    address, rest = [], npu_id
+    for size in dims:
+        address.append(rest % size)
+        rest //= size
+    return address
+
+
+def _tp_group_ids(instance, stage=0):
+    """The NPU ids of one pipeline stage's TP group.
+
+    The Chakra converter places pipeline stage ``g`` on the instance's NPU ids
+    ``[g*tp, (g+1)*tp)`` and emits the stage-to-stage transfer between
+    ``npu_id - tp`` and ``npu_id``. A TP collective therefore spans one stage's
+    ``tp_size`` ranks and never the pipeline extent. Deriving it from the
+    instance's whole range charges the TP ALLREDUCE across the PP dimension,
+    which under an explicit physical topology is a different link class.
+    """
+    start = instance.get("npu_start")
+    if start is None:
+        raise KeyError(
+            "instance is missing 'npu_start': NPU ids must be assigned before "
+            "involved_dim can be derived from physical placement."
+        )
+    tp = max(int(instance.get("tp_size", 1)), 1)
+    return list(range(start + stage * tp, start + (stage + 1) * tp))
+
+
+def _agreeing_dims(ids_per_stage, dims, what):
+    """involved_dim for a collective, required to be identical on every stage.
+
+    The trace carries one involved_dim per instance, so a placement whose
+    pipeline stages sit on different topology dimensions has no representation
+    and is raised rather than approximated.
+    """
+    seen = [_dims_spanned(ids, dims, f"{what} stage {s}")
+            for s, ids in enumerate(ids_per_stage)]
+    if len(set(map(tuple, seen))) != 1:
+        raise ValueError(
+            f"{what}: pipeline stages span different topology dimensions "
+            f"{seen}. The trace carries one involved_dim per instance, so this "
+            f"placement cannot be represented."
+        )
+    return seen[0]
+
+
+def _dims_spanned(npu_ids, dims, what):
+    """involved_dim for a collective over ``npu_ids`` on topology ``dims``.
+
+    A dimension is involved when the group's members differ in that coordinate.
+    ASTRA-Sim runs one collective phase over a *whole* dimension, so a group
+    covering only part of one is not expressible. That is raised rather than
+    approximated: silently rounding it is exactly what would make a placement
+    comparison meaningless.
+    """
+    unique = sorted(set(npu_ids))
+    coords = [set() for _ in dims]
+    for npu_id in unique:
+        for k, c in enumerate(_decompose(npu_id, dims)):
+            coords[k].add(c)
+
+    box = 1
+    for seen in coords:
+        box *= len(seen)
+    if box != len(unique):
+        raise ValueError(
+            f"{what}: NPU ids {unique} are not a product of topology dimensions "
+            f"{dims}, so the group cannot be expressed as an involved_dim vector."
+        )
+
+    involved = []
+    for k, seen in enumerate(coords):
+        if len(seen) == 1:
+            involved.append(False)
+        elif len(seen) == dims[k]:
+            involved.append(True)
+        else:
+            raise ValueError(
+                f"{what}: covers {len(seen)} of {dims[k]} positions in topology "
+                f"dimension {k}. ASTRA-Sim collectives run over a whole "
+                f"dimension, so a partial span cannot be represented."
+            )
+    return involved
+
+
+def _resolve_dp_groups(all_instances, network_dims=None):
+    """Validate DP groups and compute dp_group_size and ep_total for each instance.
+
+    ``network_dims`` declares the *physical* interconnect hierarchy. When it is
+    given, the involved_dim vectors are derived from which of those dimensions
+    each collective group's NPU ids actually vary over, instead of from the
+    parallelism degrees. When it is absent nothing changes.
+    """
     dp_groups = {}
     for inst in all_instances:
         dg = inst.get("dp_group")
@@ -203,32 +340,71 @@ def _resolve_dp_groups(all_instances):
                 # EP spans both dimensions (cross-instance ALLTOALL)
                 ep_dim = [True, True] if tp0 > 1 else [False, True]
 
+        phys = _validate_network_dims(network_dims, all_instances) if network_dims else None
+
         for m in members:
             m["dp_group_size"] = dp_size
             m["local_ep"] = local_ep
             m["ep_total"] = ep_total
-            m["tp_dim"] = tp_dim
-            m["ep_dim"] = ep_dim
+            if phys is None:
+                m["tp_dim"] = tp_dim
+                m["ep_dim"] = ep_dim
+            else:
+                # A TP collective spans one pipeline stage's ranks, not the
+                # instance's whole NPU range. vLLM's EP group is the DP x TP
+                # ranks of ONE pipeline stage (the transpose pins the PP index),
+                # so it is built stage-wise too.
+                pp = max(int(m.get("pp_size", 1)), 1)
+                m["tp_dim"] = _agreeing_dims(
+                    [_tp_group_ids(m, s) for s in range(pp)], phys,
+                    f"DP group '{group_name}' instance {m.get('instance_id')} TP")
+                # EP spreads past one instance only when the total EP degree
+                # exceeds tp_size; otherwise it stays inside the instance.
+                ep_stage_ids = (
+                    [[i for x in members for i in _tp_group_ids(x, s)] for s in range(pp)]
+                    if ep_total > tp0 else
+                    [_tp_group_ids(m, s) for s in range(pp)]
+                )
+                m["ep_dim"] = _agreeing_dims(
+                    ep_stage_ids, phys, f"DP group '{group_name}' EP")
 
     # Non-DP instances. Independent multi-instance configs still use a
     # multi-dimensional topology ([tp_size, num_groups]); local collectives
     # must be scoped to dim 0 so they do not cross instance/PP groups.
-    network_dims = _compute_network_dims(all_instances)
+    resolved_dims = _compute_network_dims(all_instances, network_dims)
+    phys = _validate_network_dims(network_dims, all_instances) if network_dims else None
     local_dim = None
-    if len(network_dims) > 1:
-        local_dim = [True] + [False] * (len(network_dims) - 1)
+    if len(resolved_dims) > 1:
+        local_dim = [True] + [False] * (len(resolved_dims) - 1)
 
     for inst in all_instances:
         if inst.get("dp_group") is None:
             inst["dp_group_size"] = 1
             inst["local_ep"] = inst["ep_size"]
             inst["ep_total"] = inst["ep_size"]
-            inst["tp_dim"] = local_dim
-            inst["ep_dim"] = local_dim if inst["ep_size"] > 1 else None
+            if phys is None:
+                inst["tp_dim"] = local_dim
+                inst["ep_dim"] = local_dim if inst["ep_size"] > 1 else None
+            else:
+                pp = max(int(inst.get("pp_size", 1)), 1)
+                own = _agreeing_dims(
+                    [_tp_group_ids(inst, s) for s in range(pp)], phys,
+                    f"instance {inst.get('instance_id')} TP")
+                inst["tp_dim"] = own
+                inst["ep_dim"] = own if inst["ep_size"] > 1 else None
 
 
-def _compute_network_dims(instances):
-    """Infer ASTRA-Sim topology dimensions from resolved instances."""
+def _compute_network_dims(instances, network_dims=None):
+    """Infer ASTRA-Sim topology dimensions from resolved instances.
+
+    An explicit ``network_dims`` replaces the inferred value outright: it
+    describes the *physical* interconnect hierarchy, which need not match the
+    parallelism hierarchy. Trailing 1s are not stripped from a declared
+    topology -- the declaration is taken as written.
+    """
+    if network_dims is not None:
+        return _validate_network_dims(network_dims, instances)
+
     dp_groups = {}
     for inst in instances:
         dg = inst.get("dp_group")
@@ -303,12 +479,12 @@ def _normalize_network_dim_values(raw_value, num_dims, field_name):
         ) from exc
 
 
-def _sync_system_collective_dims(system_config_path, instances):
+def _sync_system_collective_dims(system_config_path, instances, network_dims=None):
     """Match system collective implementation arity to final topology dims."""
     with open(system_config_path) as f:
         system_config = json.load(f)
 
-    num_dims = len(_compute_network_dims(instances))
+    num_dims = len(_compute_network_dims(instances, network_dims))
     for key in _COLLECTIVE_IMPL_KEYS:
         system_config[key] = ["ring"] * num_dims
 
@@ -347,6 +523,14 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     
     link_bw = cluster_config["link_bw"]
     link_latency = cluster_config["link_latency"]
+
+    # Optional explicit physical interconnect hierarchy. Absent means the
+    # topology is inferred from the parallelism degrees, exactly as before.
+    network_dims = cluster_config.get("network_dims")
+    if network_dims is not None:
+        # Fail before any ASTRA-Sim input file is written.
+        _normalize_network_dim_values(link_bw, len(network_dims), "link_bw")
+        _normalize_network_dim_values(link_latency, len(network_dims), "link_latency")
 
     # Memory required keys
     mem_required_keys = ["mem_size", "mem_bw", "mem_latency"]
@@ -603,6 +787,12 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             for npu_id in range(current_npu_start, current_npu_start + effective_npus):
                 npu2inst_mapping[npu_id] = instance_id
 
+            # Physical placement: the contiguous NPU id range this instance
+            # owns. involved_dim is derived from it when the cluster config
+            # declares an explicit physical topology.
+            instance["npu_start"] = current_npu_start
+            instance["npu_span"] = effective_npus
+
             current_npu_start += effective_npus
 
             config = get_config(instance["model_name"])
@@ -673,14 +863,15 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     )
 
     # Resolve DP groups across all instances.
-    _resolve_dp_groups(total_instances)
+    _resolve_dp_groups(total_instances, network_dims)
 
     # Keep collective implementation arity aligned with the final global
     # ASTRA-Sim topology, while preserving the default ring implementation.
-    _sync_system_collective_dims(system_config_path, total_instances)
+    _sync_system_collective_dims(system_config_path, total_instances, network_dims)
 
     # Generate the final ASTRA-Sim input files after all instances are known.
-    _create_network_config(network_config_path, total_instances, link_bw, link_latency)
+    _create_network_config(network_config_path, total_instances, link_bw, link_latency,
+                           network_dims)
     with open(memory_config_path, "w", encoding="utf-8") as f:
         json.dump(memory_config, f, ensure_ascii=False, indent=2)
     _validate_memory_config(memory_config_path, placement, enable_local_offloading)
@@ -716,7 +907,8 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     return cluster
 
 # generates topology according to the input arguments
-def _create_network_config(network_config_path, instances, link_bw, link_latency):
+def _create_network_config(network_config_path, instances, link_bw, link_latency,
+                           network_dims=None):
     """Create ASTRA-Sim network topology config.
 
     Topology dimensions:
@@ -724,7 +916,7 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
       - For independent instances: [tp_size, num_groups] — dim 0 for TP, dim 1 for PP/instances
       - Single GPU instances: [1]
     """
-    dims = _compute_network_dims(instances)
+    dims = _compute_network_dims(instances, network_dims)
     num_dims = len(dims)
     topology_data = {
         "topology": FlowStyleList(["FullyConnected"] * num_dims),

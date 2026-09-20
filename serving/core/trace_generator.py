@@ -991,8 +991,15 @@ def _layer_category(perf_db, layer_name):
 
 
 def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer_num=None,
-                comm_type='NONE', comm_size=0, input_loc='LOCAL', output_loc='LOCAL'):
-    """Emit a single trace layer: lookup latency, compute sizes, format, track power."""
+                comm_type='NONE', comm_size=0, input_loc='LOCAL', output_loc='LOCAL',
+                latency_ns_override=None):
+    """Emit a single trace layer: lookup latency, compute sizes, format, track power.
+
+    ``latency_ns_override`` forces the compute time instead of looking it
+    up. It exists so a layer that issues more than one in-layer collective
+    can emit its extra collectives as compute-free rows without charging
+    the layer's kernel time again (see ``_emit_sequence``).
+    """
     category = _layer_category(ctx.perf_db, layer_name)
     if category is None:
         raise KeyError(
@@ -1001,7 +1008,9 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
             f"profiler/models/<model_type>.yaml or remove it from the sequence."
         )
 
-    if category == "per_sequence":
+    if latency_ns_override is not None:
+        latency_ns = int(latency_ns_override)
+    elif category == "per_sequence":
         latency_ns = _lookup_per_sequence(ctx.perf_db, layer_name, ctx.tp_size, bctx.lm_head_len)
     elif category == "attention":
         latency_ns = _lookup_attention_with_skew(
@@ -1012,6 +1021,23 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
         )
     else:  # dense
         latency_ns = _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
+
+    # INVARIANT: every emitted COMP_NODE must have a non-zero duration.
+    #
+    # ASTRA-Sim does not reject a zero-duration COMP_NODE -- it silently never
+    # fires it, so the node's dependents wait forever. The simulation stops
+    # advancing with no traceback and no error line; the process then spins
+    # until something kills it, which surfaces as exit code 137 and looks
+    # exactly like an OOM. That cost a full 24-cell grid to diagnose: the tell
+    # was that failures split perfectly by tp_size, which no memory problem
+    # would produce.
+    #
+    # This clamp is deliberately at the single point where every trace row is
+    # built, not at the one call site that hit it, so any future path that
+    # yields 0 (a synthetic collective-only row, a profile row with time_us=0,
+    # a lookup that floors to zero) cannot reintroduce the deadlock. 1 ns is
+    # below the resolution of anything the simulator reports.
+    latency_ns = max(1, int(latency_ns))
 
     # Size calculation uses the same canonical layer names.
     if layer_name == 'attention':
@@ -1065,6 +1091,36 @@ def _tp_comm(ctx, layer_name, total_len, collective='ALLREDUCE'):
         return 0, 'NONE'
     _, _, out = calculate_sizes(ctx.model, layer_name, total_len, parallel=ctx.tp_size, fp=ctx.fp)
     return out, collective
+
+
+def _tp_collective_spec(perf_db, layer_name):
+    """Return a layer's ``tp_collective`` declaration, or None.
+
+    Declared per-architecture in the yaml catalog, so families that do
+    not declare one behave exactly as before.
+    """
+    catalog = perf_db["architecture"]["catalog"]
+    for section in catalog.values():
+        entry = (section or {}).get(layer_name)
+        if entry:
+            return entry.get("tp_collective")
+    return None
+
+
+def _tp_collective_bytes(ctx, tensor, total_len):
+    """Message size for one in-layer TP collective.
+
+    ASTRA-Sim wants the *total* size, not the per-rank slice (it divides
+    by the participant count internally), so this is the full un-sharded
+    activation width -- for an all-gather, the gathered result.
+    """
+    if tensor == "q":
+        width = ctx.n_head * ctx.head_dim
+    elif tensor in ("k", "v"):
+        width = ctx.kv_head * ctx.head_dim
+    else:  # "hidden"
+        width = ctx.config["hidden_size"]
+    return total_len * width * ctx.fp
 
 
 def _with_dim(comm_type, involved_dim):
@@ -1259,7 +1315,28 @@ def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
                     ctx.perf_db["model"], ctx.perf_db["variant"],
                 )
             continue
-        if layer_name in _TP_ALLREDUCE_AFTER:
+        spec = _tp_collective_spec(ctx.perf_db, layer_name)
+        if spec and ctx.tp_size > 1:
+            # The layer performs its own TP collective(s), which the
+            # single-GPU profiler cannot observe: it boots at
+            # tensor_parallel_size=1, so vLLM's `if tp_size > 1` branch
+            # never runs and the measured kernel time excludes them.
+            # Synthesize them here from model geometry.
+            #
+            # OLMoE's _apply_qk_norm is the case this exists for: it
+            # all-gathers q and k, normalizes at full width, then slices
+            # back, i.e. two ALLGATHERs per decoder layer per forward.
+            # The first rides on the layer's own row; any further ones
+            # become compute-free rows so the kernel time is charged once.
+            ctype = _with_dim(spec["type"], ctx.tp_dim)
+            for i, tensor in enumerate(spec["tensors"]):
+                _emit_layer(
+                    ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
+                    comm_type=ctype,
+                    comm_size=_tp_collective_bytes(ctx, tensor, bctx.total_len),
+                    latency_ns_override=None if i == 0 else 1,
+                )
+        elif layer_name in _TP_ALLREDUCE_AFTER:
             comm_size, comm_type = _tp_comm(ctx, layer_name, bctx.total_len)
             _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
                         comm_type=_with_dim(comm_type, ctx.tp_dim), comm_size=comm_size)
