@@ -59,6 +59,95 @@ MOE_TOP_K_KEYS: tuple[str, ...] = (
 )
 
 
+def compute_sharded_overrides(
+    model_config: dict[str, Any], tp: int
+) -> dict[str, Any]:
+    """HF config overrides that emulate one rank of a ``tp``-way deployment.
+
+    Divides every field in :data:`SHARD_FIELDS` by ``tp`` and pins
+    ``head_dim`` so it stays TP-invariant.
+
+    ``hidden_size`` is deliberately NOT sharded -- a real TP rank still
+    sees the full hidden state on the wire, and shrinking it would
+    corrupt qkv_proj's input width, o_proj's output width, the
+    layernorms and the MoE block. But several architectures derive::
+
+        head_dim = hidden_size // num_attention_heads
+
+    so dividing ``num_attention_heads`` makes ``head_dim`` *grow* by the
+    same factor, widening per-rank attention instead of narrowing it. A
+    16-head / 2048-hidden model at tp=8 would emulate 2 heads x 1024 =
+    the full 2048-wide q of tp=1 (TP not emulated at all), and
+    FlashAttention rejects head sizes above 256, so tp=4 and tp=8 fail
+    outright. Pinning the unsharded value keeps real ``head_dim``
+    constant while heads-per-rank divides by ``tp``, so q/k/v projection
+    width per rank divides by ``tp`` as intended.
+
+    At tp=1 the pin is numerically a no-op (it is exactly the value the
+    architecture would have derived), so tp=1 profiles are unchanged. A
+    config that already declares ``head_dim`` is authoritative and left
+    alone -- Qwen3 has ``head_dim=128`` with ``hidden/heads = 64``.
+
+    Whether a family was ever actually wrong takes TWO conditions, and
+    it is worth being precise because the answer decides whether the
+    committed profiles under ``profiler/perf/`` can be trusted:
+
+    1. does the transformers config class materialize ``head_dim``?
+       ``LlamaConfig.__init__`` sets it to
+       ``hidden_size // num_attention_heads`` at construction, i.e.
+       BEFORE vLLM applies hf_overrides, so it keeps the unsharded
+       value. ``OlmoeConfig`` does not define it at all (it is None).
+    2. does the vLLM model class consult ``config.head_dim``?
+       llama / qwen3 / qwen3_moe / mixtral / phimoe do
+       (``getattr(config, "head_dim", None) or ...``); olmoe /
+       qwen2_moe / granitemoe compute
+       ``hidden_size // total_num_heads`` unconditionally and never
+       look.
+
+    Only families failing BOTH were mis-profiled. Measured on
+    transformers 4.57.6 / vLLM 0.19.0, that is the olmoe-style set:
+    Llama-3.1-8B's config object already carries ``head_dim=128``, so
+    its committed tp2 profile is correct and this pin is a no-op for it.
+
+    So this function is the belt (it makes the value explicit for every
+    family that reads the config, regardless of whether the config class
+    happened to materialize it), and ``hooks.head_dim_patch`` is the
+    braces for the three that ignore the config entirely.
+
+    Raises:
+        TypeError: a shard field is present but not an int.
+        ValueError: a shard field is not divisible by ``tp``.
+    """
+    out: dict[str, Any] = {}
+    for field_name in SHARD_FIELDS:
+        if field_name not in model_config:
+            continue
+        val = model_config[field_name]
+        if not isinstance(val, int):
+            raise TypeError(
+                f"shard field {field_name!r} must be an int; got "
+                f"{type(val).__name__}"
+            )
+        if val % tp != 0:
+            raise ValueError(
+                f"model config field {field_name!r}={val} is not "
+                f"divisible by tp={tp}; cannot TP-shard for profiling"
+            )
+        out[field_name] = val // tp
+
+    if "head_dim" not in model_config:
+        hidden = model_config.get("hidden_size")
+        heads = model_config.get("num_attention_heads")
+        if (
+            isinstance(hidden, int)
+            and isinstance(heads, int)
+            and heads > 0
+            and hidden % heads == 0
+        ):
+            out["head_dim"] = hidden // heads
+    return out
+
+
 def probe_moe_params(hf_cfg: dict[str, Any]) -> tuple[int, int] | None:
     """Extract (num_experts, top_k) from a HuggingFace config dict.
 
@@ -82,6 +171,67 @@ def probe_moe_params(hf_cfg: dict[str, Any]) -> tuple[int, int] | None:
 # Catalog (loaded from architecture yaml)
 # ---------------------------------------------------------------------------
 
+class TPCollective(BaseModel):
+    """A TP collective performed inside a layer's own forward pass.
+
+    Declared on a :class:`LayerEntry` so it stays per-architecture: a
+    family that does not declare one emits exactly the trace it emitted
+    before this field existed.
+
+    The motivating case is OLMoE. ``OlmoeAttention._apply_qk_norm``
+    normalizes q and k over their *full* width, so at ``tp_size > 1`` it
+    all-gathers both from the TP ranks, normalizes, then slices back::
+
+        if self.tp_size > 1:
+            q = tensor_model_parallel_all_gather(q.contiguous())
+            k = tensor_model_parallel_all_gather(k.contiguous())
+        q = self.q_norm(q); k = self.k_norm(k)
+        if self.tp_size > 1:
+            q = splitter(q)[self.tp_rank]; k = splitter(k)[self.tp_rank]
+
+    That is two collectives per decoder layer per forward, on top of the
+    ALLREDUCE after ``o_proj``. No other supported family has a
+    collective between ``qkv_proj`` and ``attention``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str
+    """Collective name as the trace's ``comm_type`` column spells it:
+    ``ALLGATHER``, ``ALLREDUCE``, ``REDUCESCATTER`` or ``ALLTOALL``."""
+
+    tensors: list[str]
+    """One entry per collective the layer issues, naming the activation
+    whose full (un-sharded) width sets the message size:
+
+        ``q``       -> num_attention_heads * head_dim
+        ``k``, ``v``-> num_key_value_heads * head_dim
+        ``hidden``  -> hidden_size
+
+    ``["q", "k"]`` therefore means two collectives per layer, sized from
+    the q and k widths respectively. ASTRA-Sim wants the total (not
+    per-rank) size, which for an all-gather is the gathered result."""
+
+    @model_validator(mode="after")
+    def _check(self):
+        allowed_types = {"ALLGATHER", "ALLREDUCE", "REDUCESCATTER", "ALLTOALL"}
+        if self.type not in allowed_types:
+            raise ValueError(
+                f"tp_collective.type={self.type!r} must be one of "
+                f"{sorted(allowed_types)}"
+            )
+        allowed_tensors = {"q", "k", "v", "hidden"}
+        if not self.tensors:
+            raise ValueError("tp_collective.tensors must not be empty")
+        bad = [t for t in self.tensors if t not in allowed_tensors]
+        if bad:
+            raise ValueError(
+                f"tp_collective.tensors {bad} must be drawn from "
+                f"{sorted(allowed_tensors)}"
+            )
+        return self
+
+
 class LayerEntry(BaseModel):
     """One row of the catalog.
 
@@ -104,6 +254,18 @@ class LayerEntry(BaseModel):
     tp_stable: bool = False
     """If True, profile this layer only at TP=1 and replicate the
     results into every tp{N}/ folder."""
+
+    tp_collective: TPCollective | None = None
+    """Optional TP collective this layer performs *internally*, which the
+    single-GPU profiler can never observe (it always boots
+    ``tensor_parallel_size=1``, so every ``if tp_size > 1`` branch is
+    dead) and which the simulator therefore has to synthesize
+    analytically from model geometry.
+
+    Only declare this for a genuine in-layer collective. The ALLREDUCE
+    that follows ``o_proj`` / ``down_proj`` and the ALLTOALL around
+    ``moe`` are attached by the simulator from the cluster config and
+    must NOT be declared here."""
 
 
 class Catalog(BaseModel):

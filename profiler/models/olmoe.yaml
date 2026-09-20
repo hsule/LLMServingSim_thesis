@@ -1,0 +1,91 @@
+# OLMoE family — class catalog (AI2 mixture-of-experts decoder-only LLMs).
+#
+# This catalog covers allenai/OLMoE-1B-7B-* and any variant that
+# instantiates ``OlmoeForCausalLM``. Pick the specific model at the CLI.
+#
+# The MoE block is ``OlmoeMoE``, which wraps the gate and the fused
+# experts; we profile that wrapper as a single unit, like Qwen3-MoE's
+# ``Qwen3MoeSparseMoeBlock``. Every layer is MoE (there is no dense FFN
+# variant), so ``mlp_dense`` is empty. ``num_experts`` /
+# ``num_experts_per_tok`` are read from the HF config at engine boot,
+# not declared here.
+#
+# Canonical layer names mirror vLLM's attribute names (see
+# ../vllm/vllm/model_executor/models/olmoe.py).
+#
+# ``sequence:`` describes the ordered pipeline the simulator's
+# trace_generator walks to emit one iteration. Names must appear in
+# ``catalog`` below. TP ALLREDUCE (after ``o_proj`` / ``down_proj``)
+# and EP ALLTOALL (around ``moe``) are attached by the simulator from
+# cluster config and need not be listed here.
+#
+# ---------------------------------------------------------------------
+# Two things make OLMoE different from every other family here, both
+# concentrated in qk_norm. See its catalog entry below.
+# ---------------------------------------------------------------------
+
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm, qkv_proj, qk_norm, rotary_emb, attention]
+  post_attn: [o_proj, layernorm]
+  mlp_dense: []
+  mlp_moe:   [moe]
+  head:      [final_layernorm, lm_head, sampler]
+
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: RMSNorm
+      within: OlmoeDecoderLayer
+      tp_stable: true
+    qkv_proj:
+      vllm: QKVParallelLinear
+    qk_norm:
+      # OLMoE normalizes q and k over their FULL width, not per-head as
+      # Qwen3 does (Qwen3: RMSNorm(head_dim); OLMoE:
+      # RMSNorm(total_num_heads * head_dim)). At tp_size > 1
+      # ``OlmoeAttention._apply_qk_norm`` therefore all-gathers q and k
+      # across the TP ranks, normalizes at full width, and slices the
+      # result back to the local rank.
+      #
+      # tp_stable: the norm always runs at the full un-sharded width, on
+      # every rank, at every TP degree — which is exactly the width a
+      # TP=1 profile measures. Profiling once at TP=1 and replicating is
+      # therefore the *correct* cost here, not an approximation.
+      #
+      # tp_collective: the two all-gathers are invisible to the profiler,
+      # which always boots tensor_parallel_size=1 so the branch is dead.
+      # The simulator synthesizes them analytically from model geometry
+      # instead — two ALLGATHERs per decoder layer per forward, sized by
+      # the gathered q and k widths.
+      vllm: RMSNorm
+      within: OlmoeAttention
+      tp_stable: true
+      tp_collective:
+        type: ALLGATHER
+        tensors: [q, k]
+    rotary_emb:
+      vllm: RotaryEmbedding
+    o_proj:
+      vllm: RowParallelLinear
+      within: OlmoeAttention
+    final_layernorm:
+      vllm: RMSNorm
+      within: OlmoeForCausalLM
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    attention:
+      vllm: Attention
+  moe:
+    moe:
+      vllm: OlmoeMoE

@@ -27,12 +27,20 @@ from __future__ import annotations
 from typing import Any
 
 from profiler.core.hooks.batch import Shot, assemble_scheduler_output
+from profiler.core.hooks.head_dim_patch import maybe_apply_from_env
 from profiler.core.hooks.moe_hook import (
     ExpertRoute,
     force_moe_routing,
     single_moe_layer,
 )
 from profiler.core.hooks.timings import extract_samples
+
+# vLLM resolves ``worker_extension_cls`` (and therefore imports this
+# module) inside the worker, before the model is constructed. Pinning
+# head_dim here is the last point at which it still affects the shapes
+# the attention modules are built with. No-op unless the host exported
+# PROFILER_PINNED_HEAD_DIM, and numerically a no-op at tp=1.
+maybe_apply_from_env()
 
 
 class Extension:

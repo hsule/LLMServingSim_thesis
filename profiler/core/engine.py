@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import gc
 import json
+import os
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -30,10 +31,11 @@ from vllm import LLM
 from profiler.core import logger as log
 from profiler.core.config import (
     HOST_ENGINE_DEFAULTS,
-    SHARD_FIELDS,
     ProfileArgs,
+    compute_sharded_overrides,
     probe_moe_params,
 )
+from profiler.core.hooks.head_dim_patch import ENV_PINNED_HEAD_DIM
 
 
 # ---------------------------------------------------------------------------
@@ -168,26 +170,10 @@ def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
             "config.read_model_config(path) in the CLI layer."
         )
 
-    sharded_overrides: dict[str, Any] = {}
-    for field_name in SHARD_FIELDS:
-        if field_name not in args.model_config:
-            log.debug(
-                "shard field %r not in model config; skipping",
-                field_name,
-            )
-            continue
-        val = args.model_config[field_name]
-        if not isinstance(val, int):
-            raise TypeError(
-                f"shard field {field_name!r} must be an int; got "
-                f"{type(val).__name__}"
-            )
-        if val % tp != 0:
-            raise ValueError(
-                f"model config field {field_name!r}={val} is not "
-                f"divisible by tp={tp}; cannot TP-shard for profiling"
-            )
-        sharded_overrides[field_name] = val // tp
+    # Divide SHARD_FIELDS by tp and pin head_dim. See
+    # config.compute_sharded_overrides for why hidden_size is left alone
+    # and why the pin is required for correct per-rank geometry.
+    sharded_overrides = compute_sharded_overrides(args.model_config, tp)
 
     # 5. Sharding wins.
     kwargs["hf_overrides"] = _deep_merge(hf_overrides, sharded_overrides)
@@ -237,6 +223,20 @@ def spin_up(
     log.debug("model config written to %s", config_path)
 
     kwargs["model"] = str(tmpdir)
+
+    # Hand the pinned head_dim to the worker. Architectures that honour
+    # ``config.head_dim`` are already correct via hf_overrides; the three
+    # that derive it unconditionally (olmoe / qwen2_moe / granitemoe) are
+    # corrected by hooks.head_dim_patch, which reads this variable at
+    # worker-extension import time. Set in the environment rather than
+    # patched in-process because vLLM may build the model in a spawned
+    # EngineCore process, which inherits environ but not monkeypatches.
+    pinned_head_dim = kwargs.get("hf_overrides", {}).get("head_dim")
+    if pinned_head_dim is None:
+        pinned_head_dim = args.model_config.get("head_dim")
+    if isinstance(pinned_head_dim, int) and pinned_head_dim > 0:
+        os.environ[ENV_PINNED_HEAD_DIM] = str(pinned_head_dim)
+        log.debug("exported %s=%d", ENV_PINNED_HEAD_DIM, pinned_head_dim)
 
     with log.capture_stdio():
         llm = LLM(**kwargs)
