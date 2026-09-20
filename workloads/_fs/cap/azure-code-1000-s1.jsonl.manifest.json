@@ -1,0 +1,60 @@
+{
+  "generator": "azure",
+  "preregistration": "thesis-agentic-sharding/fleetsieve-moving-oracle-audit.md \u00a75.2 (ingestion), \u00a75.3 (rate ladder)",
+  "source": {
+    "path": "workloads/traces/AzureLLMInferenceTrace_code_1week.csv",
+    "name": "AzureLLMInferenceTrace_code_1week.csv",
+    "size_bytes": 691989454,
+    "mtime": "2026-09-12T15:41:45.639414+00:00",
+    "schema": [
+      "TIMESTAMP",
+      "ContextTokens",
+      "GeneratedTokens"
+    ]
+  },
+  "frozen": {
+    "window_offset_hours": 48.0,
+    "num_reqs": 100,
+    "scale_ladder": [
+      "1/64",
+      "1/32",
+      "1/16",
+      "1/8",
+      "1/4",
+      "1/2",
+      "1"
+    ]
+  },
+  "used": {
+    "window_offset_hours": 48.0,
+    "num_reqs": 1000,
+    "scale": 1.0,
+    "scale_arg": "1",
+    "deviates_from_frozen": true
+  },
+  "output": "workloads/_fs/cap/azure-code-1000-s1.jsonl",
+  "summary": {
+    "num_reqs": 1000,
+    "window_first_line": 3459927,
+    "window_start": "2024-05-12 00:00:00",
+    "window_end": "2024-05-12 00:01:06",
+    "native_span_sec": 66.892276,
+    "scaled_span_sec": 66.892276,
+    "native_rate_rps": 14.934459697559104,
+    "scaled_rate_rps": 14.934459697559104,
+    "input_toks_mean": 2457.673,
+    "input_toks_median": 1874.0,
+    "input_toks_min": 1,
+    "input_toks_max": 7686,
+    "output_toks_mean": 25.899,
+    "output_toks_median": 8.0,
+    "output_toks_min": 1,
+    "output_toks_max": 1500,
+    "rows_with_zero_input_toks": 0,
+    "rows_with_zero_output_toks": 0,
+    "non_monotonic_arrivals": 0,
+    "out_of_order_rows_scanned": 0,
+    "timestamp_shape_drift_rows": 0,
+    "timestamp_zone_offset_sec": 0
+  }
+}
