@@ -3,6 +3,9 @@
 Usage:
     python -m workloads.generators sharegpt --model <hf-id> --num-reqs 300 --sps 10 \
         --source <path-or-hf-id> --output workloads/sharegpt-<model>-<n>-sps<r>.jsonl
+
+    python -m workloads.generators azure --source <AzureLLMInferenceTrace_*.csv> \
+        --scale 1/16 --output workloads/_fs/azure-<trace>-100-s16.jsonl
 """
 
 from __future__ import annotations
@@ -19,10 +22,19 @@ def main() -> int:
     from workloads.generators.sharegpt import register_args as sg_register
     sg_register(sg)
 
+    az = sub.add_parser("azure", help="Azure LLM inference trace (2024) -> "
+                                      "LLMServingSim JSONL")
+    from workloads.generators.azure import register_args as az_register
+    az_register(az)
+
     args = parser.parse_args()
 
     if args.generator == "sharegpt":
         from workloads.generators.sharegpt import run
+        return run(args)
+
+    if args.generator == "azure":
+        from workloads.generators.azure import run
         return run(args)
 
     parser.error(f"Unknown generator: {args.generator}")

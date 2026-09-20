@@ -10,7 +10,12 @@ Produces JSONL workloads in the format the simulator expects:
       "output_tok_ids":   list[int]      # tokenized output (informational)
     }
 
+``input_tok_ids`` / ``output_tok_ids`` are optional: a request without
+them allocates KV normally but registers no prefix-cache hit.
+
 Each generator is invoked via ``python -m workloads.generators <name> ...``.
 Currently shipped:
     sharegpt   ShareGPT conversations -> sim workload, configurable rate/limit/seed
+    azure      Azure LLM inference trace (2024 release) -> sim workload, replayed
+               from one contiguous window at a frozen arrival-rate scale
 """
