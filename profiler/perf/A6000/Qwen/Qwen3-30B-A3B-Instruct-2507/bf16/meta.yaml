@@ -1,0 +1,42 @@
+profiler_version: 1.0.0
+vllm_version: 0.19.0
+cuda_version: '12.9'
+gpu: NVIDIA RTX A6000
+hardware: A6000
+profiled_at: '2026-08-01T09:20:53+00:00'
+architecture: qwen3_moe
+architecture_sha256: 784ed86cdd6b8a71c1c8cc82a5af96e49a70607e40ac8570b7b9341eb3dc5800
+model: Qwen/Qwen3-30B-A3B-Instruct-2507
+variant: bf16
+tp_degrees: [1, 2]
+engine_effective:
+  load_format: dummy
+  enforce_eager: true
+  skip_tokenizer_init: true
+  enable_prefix_caching: false
+  generation_config: vllm
+  tensor_parallel_size: 1
+  block_size: 16
+  gpu_memory_utilization: 0.9
+  max_num_batched_tokens: 2048
+  max_num_seqs: 256
+  hf_overrides:
+    num_hidden_layers: 1
+    intermediate_size: 3072
+    num_attention_heads: 16
+    num_key_value_heads: 2
+    vocab_size: 75968
+  worker_extension_cls: profiler.core.hooks.extension.Extension
+  model: /tmp/profiler_model_ljbuyv5q
+attention_grid:
+  max_kv: 16384
+  chunk_factor: 2.0
+  kv_factor: 2.0
+  chunks: 0, 16-2048 x2
+  n_decode: 0, 1-256 x2
+  kv: 0, 16-16384 x2
+measurement_iterations: 3
+skew_profile:
+  enabled: false
+skew_fit:
+  enabled: false
