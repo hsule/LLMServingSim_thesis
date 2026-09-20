@@ -703,6 +703,179 @@ what the `saturated_*` scenarios are for; `example_trace.jsonl` never gets
 there, and its DP members always drain together, which is what the `*_uneven`
 scenarios are for.
 
+## Profiling on a rented / billed GPU
+
+Everything below is measured, not estimated. It matters because the obvious
+mental model ("rent the fastest GPU, profiling will be fast") is wrong.
+
+### Profiling is CPU-bound, not GPU-bound
+
+Sampled over 30 s on two live sweeps:
+
+| host | GPU busy |
+| --- | --- |
+| RTX 4090 + i7-13700K | mean **2.8%**, max 7% |
+| RTX A6000 + Xeon w5-2445 | mean **5.5%**, max 35% |
+
+`py-spy` on the worker shows the hot frame is not a kernel:
+
+```
+EngineCore (active+gil):
+    __exit__ (torch/autograd/profiler.py:401)
+    stop_trace (torch/profiler/profiler.py:276)
+    __exit__ (vllm/profiler/layerwise_profile.py:397)
+    fire (profiler/core/hooks/extension.py:125)
+```
+
+Each shot runs a **1-layer** forward (tens of microseconds); the rest is torch
+profiler event post-processing, holding the GIL. Consequences:
+
+- Wall-clock is set by **single-core CPU speed**. Measured per-attention-shot:
+  **0.104 s** at `--measurement-iterations 1` on an i7-13700K, **0.175 s** on a
+  Xeon w5-2445 — a 1.7x spread from the CPU alone.
+- A rented H100 is idle ~97% of the time. Pick the SKU with the best
+  single-core CPU, not the most vCPUs; the hot path does not parallelise.
+- Renting is only justified when you need *that device's* kernel latencies.
+
+### Do not judge liveness by GPU utilization or the log
+
+vLLM V1 runs the model in a separate `VLLM::EngineCore` process. The parent
+blocks in `collective_rpc` at ~0% CPU **by design**, GPU utilization sits near
+zero, and rich's progress bar uses `\r` so it never flushes to a redirected
+log. All three look identical to a hang. Two healthy runs were killed this way.
+
+Measure the **child**:
+
+```bash
+E=$(pgrep -f VLLM::EngineCore | head -1)
+A=$(awk '{print $14+$15}' /proc/$E/stat); sleep 20
+B=$(awk '{print $14+$15}' /proc/$E/stat); echo $((B-A))   # healthy ~2000 per 20 s
+```
+
+Below ~100 ticks/20 s is genuinely stuck. And never set a probe timeout shorter
+than the known phase duration — a 330 s timeout "reproduced" a hang in a phase
+that legitimately takes 6+ minutes.
+
+### Nothing needs uploading
+
+`HOST_ENGINE_DEFAULTS` sets `load_format: "dummy"`, so vLLM never reads a
+checkpoint, and `spin_up` writes the model's `config.json` into a tmpdir and
+points vLLM there. Profiling is **fully offline**: no HF Hub access, no
+`HF_TOKEN`, no multi-GB weight download. Only a few MB of CSVs come back.
+
+### Expected shot counts are computable before you boot
+
+Enumerate them from the profiler's own generators — no GPU required — and use
+them as the completion criteria:
+
+```python
+len(list(cat.compose_shots(arch, args, limits, tp)))   # per category
+len(skew._build_cases(args, limits))                   # skew
+```
+
+`limits` needs `max_model_len` (from the model config) and MNBT/MSQ. This
+reproduces committed bundles exactly, so it is trustworthy. Two gotchas:
+
+- The **attention grid** is capped by `kv_cap = min(attention_max_kv,
+  max_model_len)`, so a 4k-context model produces ~4.7k shots where a 32k+ model
+  produces ~8.6k.
+- Bundles profiled before 2026-08 used a looser feasibility filter and have
+  ~19.4k attention rows for the same declared grid. They are **not** row-count
+  comparable with anything profiled since.
+
+### Exit code 0 does not mean complete
+
+`main()` returns 0 unconditionally; only an uncaught exception is non-zero. And
+`runner.py` treats a category that yields **zero shots** as a `log.warning` and
+continues. Always verify row counts per CSV, and `grep -c "produced no shots"`
+in the log. A crash mid-category also loses that category's unflushed rows —
+`sink.flush()` runs only after the shot loop — so resume granularity is **per
+completed category**, not per shot.
+
+### Resume, and what destroys it
+
+Resume is the default: `DedupSink.preload()` seeds from the existing CSV and
+`prior_shot_keys()` skips those shots. **Never pass `--force` on a retry** — it
+wipes every CSV. `--only-skew` adds skew to a finished bundle without redoing
+anything else.
+
+Cache-identity caveat: the bundle path is
+`perf/<hardware>/<model>/<variant>/tp<N>/`, and rows carry only the shot key.
+Re-running the same path with different MNBT / MSQ / `attention_max_kv` / skew
+factors and **without** `--force` merges rows from two grids into one file while
+`meta.yaml` records only the last run's settings. Any grid-setting change needs
+`--force` or a fresh `--out-root`.
+
+### TP feasibility is stricter than vLLM
+
+`compute_sharded_overrides` requires every `SHARD_FIELDS` entry to divide `tp`
+exactly. vLLM itself is looser for KV heads: when `num_key_value_heads <
+tp_size` it **replicates** them (`num_kv_heads = max(1, total // tp)`, requiring
+`tp % total == 0`). So Qwen3-30B-A3B (`num_key_value_heads=4`) is rejected at
+tp8 by the profiler even though vLLM would run it. Other bundled models
+(kv_heads 8 or 16) reach tp8 fine.
+
+### Smoke before a long run, and validate the pristine tree
+
+A ~7 minute smoke (`--tp 1,<max> --skip-skew --attention-max-kv 64
+--measurement-iterations 1 --out-root <scratch>`) catches CPU fallback, broken
+TP geometry, and a `persist_meta` crash — the last of which happens *after* the
+whole sweep and takes `meta.yaml` and `skew_fit.csv` with it. Include the
+**largest** TP: `--tp` order is preserved, so the highest TP runs last and a
+defect there surfaces hours in.
+
+Validate from a **pristine checkout** of the commit the remote will clone, not
+your dirty working tree, or you are testing different bytes than you will run.
+
+Sanity checks that catch real breakage without over-constraining: every
+`time_us` positive and non-NaN, values varying within a file (all-identical
+means CPU fallback), and per-rank dense cost falling roughly as 1/TP
+(`qkv_proj` measured 0.261 and `o_proj` 0.294 at tp4 vs tp1 — ideal 0.25).
+
+## ASTRA-Sim fails by hanging, not by raising
+
+Two distinct defects in this repo end the same way: the simulation stops
+advancing, prints no traceback and no error line, and the process spins until
+something kills it. **Exit code 137 is the downstream consequence, not the root
+cause.** It looks exactly like an OOM and will be misread as one.
+
+Known silent-hang causes:
+
+- **A COMP_NODE with `comp_time == 0`.** ASTRA-Sim never fires it, so its
+  dependents wait forever. `_emit_layer` now clamps every emitted row to
+  `max(1, latency_ns)` at the single point where trace rows are built, so no
+  future path can reintroduce it. `serving/tests/test_trace_invariants.py`
+  asserts the invariant over real emitted traces.
+- **A pipeline stage cut on a non-block boundary** — the send/recv tracker keys
+  on `(tag, src, dst, chunk_size, chunk_id)` and a size mismatch deadlocks the
+  receiving NPU (issue #55).
+- **A DP batch the start NPU cannot claim**, or one dispatched with
+  `workload_name` still `None` (issue #65).
+
+### How to tell a hang from an OOM
+
+`docker inspect`'s `OOMKilled` / `FinishedAt` describe the container's **last
+exit**, and survive a restart. On a running container they can be stale by days.
+Check `State.Running` and `StartedAt` before believing them.
+
+The reliable discriminator is **the shape of the failure across the grid**. A
+memory problem clusters in time and hits whatever happened to be running. A
+hang clusters by *configuration*. When 24 of 32 cells failed, the split was:
+
+```
+dp8_tp1_ep1   8/8 pass    tp_size = 1
+dp4_tp2_ep2   0/8         tp_size = 2
+dp2_tp4_ep4   0/8         tp_size = 4
+tp8_ep8       0/8         tp_size = 8
+```
+
+Perfect separation by `tp_size` — no memory problem produces that. The failing
+branch was the one that only runs at `tp_size > 1`.
+
+Confirm by control, not inspection: remove the suspect declaration (here, the
+`tp_collective` block from the architecture yaml) and re-run the same cell. It
+completed with exit 0, which localised the defect to the new code in one step.
+
 ## Common Pitfalls
 
 - **Don't edit `astra-sim/`** unless the change targets simulator integration
