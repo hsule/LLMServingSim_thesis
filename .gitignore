@@ -30,3 +30,5 @@ astra-sim/inputs/runs/
 
 # thesis
 thesis*/*
+# raw Azure traces (1.8 GB, downloaded)
+workloads/traces/
