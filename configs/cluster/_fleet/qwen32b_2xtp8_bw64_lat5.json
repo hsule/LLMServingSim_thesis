@@ -1,0 +1,43 @@
+{
+    "num_nodes": 1,
+    "link_bw": 64.0,
+    "link_latency": 5000,
+    "nodes": [
+        {
+            "num_instances": 2,
+            "cpu_mem": {
+                "mem_size": 512,
+                "mem_bw": 256,
+                "mem_latency": 0
+            },
+            "instances": [
+                {
+                    "model_name": "Qwen/Qwen3-32B",
+                    "hardware": "A6000",
+                    "npu_mem": {
+                        "mem_size": 48,
+                        "mem_bw": 768,
+                        "mem_latency": 0
+                    },
+                    "pp_size": 1,
+                    "pd_type": null,
+                    "num_npus": 8,
+                    "tp_size": 8
+                },
+                {
+                    "model_name": "Qwen/Qwen3-32B",
+                    "hardware": "A6000",
+                    "npu_mem": {
+                        "mem_size": 48,
+                        "mem_bw": 768,
+                        "mem_latency": 0
+                    },
+                    "pp_size": 1,
+                    "pd_type": null,
+                    "num_npus": 8,
+                    "tp_size": 8
+                }
+            ]
+        }
+    ]
+}
