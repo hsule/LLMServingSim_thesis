@@ -27,3 +27,6 @@ astra-sim/inputs/runs/
 .copilot/
 .aider*
 .continue/
+
+# thesis
+thesis*/*
