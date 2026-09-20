@@ -32,13 +32,34 @@ class Controller():
             line = p.stdout.readline()
             # For debugging
             # print(line, end='')
+            if line == "":
+                self._raise_child_gone(p, "read_wait")
             out.append(line)
         return out
+
+    def _raise_child_gone(self, p, where):
+        """readline() returned "" so ASTRA-Sim's stdout is closed: the child exited or
+        crashed. Without this the loops above spin on EOF forever, at 100 % CPU and with
+        `out` growing without bound (10 GB in 12 minutes when observed)."""
+        try:
+            rc = p.wait(timeout=5)
+        except Exception:
+            rc = None
+        err = ""
+        try:
+            err = p.stderr.read()[-2000:] if p.stderr else ""
+        except Exception:
+            pass
+        raise RuntimeError(f"ASTRA-Sim stdout closed in {where} (exit code {rc}); "
+                           f"stderr tail: {err.strip()!r}")
 
     def check_end(self, p):
         out = ["",""]
         while out[-2] != "All Request Has Been Exited\n" and out[-2] != "ERROR: Some Requests Remain\n":
-            out.append(p.stdout.readline())
+            line = p.stdout.readline()
+            if line == "":
+                self._raise_child_gone(p, "check_end")
+            out.append(line)
             p.stdout.flush()
         print(out[-4], end='')
         print(out[-2], end='')
