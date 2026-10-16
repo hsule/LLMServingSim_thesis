@@ -10,7 +10,8 @@ class Router:
             num_instances,
             schedulers, req_num,
             routing_policy="RR",
-            seed=42
+            seed=42,
+            load_waiting_weight=4
     ):
         self.schedulers = schedulers
         self.num_instances = num_instances
@@ -21,6 +22,7 @@ class Router:
         self.req_num = req_num
         self.routing_policy = routing_policy.upper()
         self.seed = seed
+        self.load_waiting_weight = load_waiting_weight   # LOAD's weight on waiting requests (vLLM: 4)
         self._rnd = random.Random(seed) if seed is not None else random
         self.prefill_rr_counter = 0
         self.decode_rr_counter = 0
@@ -82,7 +84,7 @@ class Router:
             sched = schedulers[idx]
             waiting = len(sched.waiting)
             running = len(sched.running)
-            raw_score = waiting * 4 + running
+            raw_score = waiting * self.load_waiting_weight + running
             capacity = getattr(sched, "max_num_seqs", 0)
             score = raw_score
             if capacity not in (0, float('inf')):

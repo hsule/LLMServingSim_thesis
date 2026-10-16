@@ -280,6 +280,8 @@ def main():
     parser.add_argument('--request-routing-policy', type=str, choices=['LOAD', 'RR', 'RAND', 'CUSTOM'], default='LOAD',
                         help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
                         'RR (round-robin), RAND (random), CUSTOM (user-defined)')
+    parser.add_argument('--load-waiting-weight', type=int, default=4,
+                        help='LOAD routing score is waiting * weight + running; 4 matches vLLM\'s DP load balancer')
     parser.add_argument('--expert-routing-policy', type=str,
                         choices=['BALANCED', 'RR', 'RAND', 'CUSTOM'],
                         default='BALANCED',
@@ -387,6 +389,7 @@ def main():
     
     _dtype_to_bits = {'float16': 16, 'bfloat16': 16, 'float32': 32, 'fp8': 8, 'int8': 8}
     request_routing_policy=args.request_routing_policy
+    load_waiting_weight = args.load_waiting_weight
     expert_routing_policy=args.expert_routing_policy
     enable_prefix_sharing=args.enable_prefix_sharing
     prefix_storage=args.prefix_storage
@@ -564,7 +567,8 @@ def main():
     # Controller for astra-sim process communication
     controller = Controller(total_npu)
     # Global Request Router
-    router = Router(num_instances, schedulers, num_req, request_routing_policy)
+    router = Router(num_instances, schedulers, num_req, request_routing_policy,
+                    load_waiting_weight=load_waiting_weight)
     # Power Modeling if enabled
     if power_modeling:
         power_model = PowerModel(power_configs)
