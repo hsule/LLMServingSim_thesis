@@ -305,7 +305,10 @@ class Scheduler:
                 num_decode += 1
                 kv_len += computed_before
                 decode_k_list.append(computed_before)
-            if req.is_init:
+            # First schedule only, as vLLM's scheduled_ts. is_init stays set
+            # until the whole prompt is computed, so without the second check a
+            # chunked prefill would overwrite this at every chunk.
+            if req.is_init and req.queuing_delay < 0:
                 req.set_que_delay(current)
             if self.pd_type == "prefill":
                 # The paired decode instance needs this chunk's KV, plus the KV
