@@ -1,5 +1,7 @@
 from enum import Enum
 
+from . import slo_truncate
+
 
 class RequestStatus(Enum):
     """Where the scheduler is holding this request.
@@ -70,6 +72,10 @@ class Request:
         self.session_id = None
         self.sub_request_index = None
 
+        t = slo_truncate.active()
+        if t is not None and id >= 0:
+            t.on_arrival(id, arrival)
+
     # to print the request information
     def __str__(self):
         return str(self.__dict__) 
@@ -77,6 +83,9 @@ class Request:
     def add_latency(self, end_time):
         self.end_time = end_time
         self.latency = self.end_time - self.arrival
+        t = slo_truncate.active()
+        if t is not None:
+            t.on_event("latency", self.id, self.latency)
         self.input = self.original_input
         if self.output == self.input + 1:
             self.tpot = 0
@@ -93,6 +102,9 @@ class Request:
     def set_ttft(self, current):
         self.ttft = current - self.arrival
         self.recent_end = current
+        t = slo_truncate.active()
+        if t is not None:
+            t.on_event("TTFT", self.id, self.ttft)
     
     def log(self):
         print("         scheduled request : {}".format(self.__dict__))

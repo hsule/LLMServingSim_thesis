@@ -24,6 +24,7 @@ from serving.core.trace_generator import *
 from serving.core.pim_model import *
 from serving.core.config_builder import *
 from serving.core.router import *
+from serving.core import slo_truncate
 from serving.core.power_model import *
 from serving.core.logger import *
 from serving.core.run_paths import build_run_paths, resolve_run_id
@@ -295,6 +296,21 @@ def main():
                         'P2C (power of two choices on in-flight requests, vLLM Router), CUSTOM (user-defined)')
     parser.add_argument('--load-waiting-weight', type=int, default=4,
                         help='LOAD routing score is waiting * weight + running; 4 matches vLLM\'s DP load balancer')
+    parser.add_argument('--slo-truncate', type=str, default=None,
+                        help='stop the run as soon as its p99 SLO verdict is certainly infeasible, e.g. '
+                        '"TTFT=5" or "TTFT=2,latency=30" (seconds). Writes <output>.truncated.json and a partial '
+                        'output CSV. Needs --output. Off by default')
+    parser.add_argument('--slo-window', type=str, default="30,270",
+                        help='measurement window for --slo-truncate as "warmup,window" in seconds after t0')
+    parser.add_argument('--slo-t0-ns', type=int, default=None,
+                        help='t0 for --slo-truncate (default: this run\'s first arrival). A part of a split trace '
+                        'passes the whole trace\'s first arrival')
+    parser.add_argument('--slo-total-requests', type=int, default=None,
+                        help='requests of the whole trace for --slo-truncate (default: this run\'s own)')
+    parser.add_argument('--slo-prior', type=str, default=None,
+                        help='violations already established for the window by other parts, e.g. "TTFT=3"')
+    parser.add_argument('--slo-margin', type=float, default=0.0,
+                        help='seconds added to every SLO when counting violations (timing tolerance of a part)')
     parser.add_argument('--expert-routing-policy', type=str,
                         choices=['BALANCED', 'RR', 'RAND', 'CUSTOM'],
                         default='BALANCED',
@@ -590,6 +606,21 @@ def main():
     # Load requests into router (routed in real-time during simulation)
     if dataset != None:
         router.load_requests(dataset, enable_prefix_caching=any_prefix_caching, is_init=is_init)
+        if args.slo_truncate:
+            if output_file is None:
+                raise ValueError("--slo-truncate needs --output")
+            if any(inst.get("dp_group") is not None for inst in instances):
+                raise ValueError("--slo-truncate does not support DP groups (dummy batches)")
+            kv = lambda spec: {k: float(v) for k, v in (x.split("=") for x in spec.split(","))} if spec else {}
+            warm, win = (float(x) for x in args.slo_window.split(","))
+            own_total = len(router._pending_requests) + sum(
+                len(sess['sub_requests']) - sess['next_index'] for sess in router._deferred_sessions.values())
+            slo_truncate.install(slo_truncate.SloTruncator(
+                kv(args.slo_truncate), warm, win,
+                args.slo_t0_ns if args.slo_t0_ns is not None
+                else min(r['arrival_time_ns'] for r in router._pending_requests),
+                args.slo_total_requests if args.slo_total_requests is not None else own_total,
+                prior={k: int(v) for k, v in kv(args.slo_prior).items()}, margin_s=args.slo_margin))
     else:
         # Manually adding request (legacy: route all upfront)
         for i in range(16):
@@ -720,6 +751,20 @@ def main():
         if instances[instance_id]["pd_type"] != "prefill":
             for req in finished_reqs:
                 router.notify_request_completed(req.id, current)
+
+        # --slo-truncate: stop once the SLO verdict is certainly infeasible (serving/core/slo_truncate.py)
+        trunc = slo_truncate.active()
+        if trunc is not None and trunc.check(current):
+            trunc.write((output_file if os.path.isabs(output_file) else f"../{output_file}") + ".truncated.json")
+            print_markup(f"[sim.heading]▶ SLO truncation[/]: {trunc.fired['metric']} violations "
+                         f"{trunc.fired['violations'] + trunc.fired['prior']} >= {trunc.fired['threshold']} "
+                         f"at {current / 1e9:.3f} s; the run is infeasible, stopping")
+            for i in range(num_instances):
+                schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
+            p.kill(); p.wait()
+            if not (args.keep_inputs or args.save_trace_text):
+                _cleanup_inputs_root(run_paths, logger)
+            return
 
         # Add prefill ended requests to decode instance
         if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:
