@@ -39,3 +39,6 @@ workloads/_fs/**/.mk_*
 
 # thesis working folders (kept out of the repo)
 thesis*/*
+
+# slide / handoff working folders, named by date
+[01][0-9][0-3][0-9]/
