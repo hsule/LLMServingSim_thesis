@@ -2,6 +2,7 @@ import bisect
 import pandas as pd
 from time import time
 import csv
+import json
 import os
 
 from .request import *
@@ -15,6 +16,21 @@ from .pim_model import *
 import numpy as np
 
 # class that shedules request of astra-sim
+
+# Event trace for differential testing (A3), off unless LLMSS_EVENT_LOG names a file.
+# One JSON line per batch formed and per batch completed; never read back by the simulator.
+_EVENT_LOG = None
+
+
+def _event(rec):
+    global _EVENT_LOG
+    path = os.environ.get("LLMSS_EVENT_LOG")
+    if not path:
+        return
+    if _EVENT_LOG is None:
+        _EVENT_LOG = open(path, "a", buffering=1)
+    _EVENT_LOG.write(json.dumps(rec) + "\n")
+
 class Scheduler:
     """vLLM V1-style continuous batching over a per-tier block pool.
 
@@ -338,6 +354,8 @@ class Scheduler:
         batch.write_through = write_through_bytes
         self.inflight.append(batch)
         self.logger.info("Scheduling new batch #%d to NPU[%d]", batch.batch_id, sys)
+        _event({"ev": "sched", "inst": self.instance_id, "t": int(current), "batch": batch.batch_id,
+                "reqs": [[req.id, num_new, computed_before] for req, num_new, computed_before in scheduled]})
         return batch
 
     def _schedule_existing(self, sys, batch_id):
@@ -378,6 +396,7 @@ class Scheduler:
             return prompt_t, gen_t, end_reqs
 
         self.logger.info("Batch #%d is done", batch.batch_id)
+        _event({"ev": "done", "inst": self.instance_id, "t": int(finish), "batch": batch.batch_id})
 
         for req in batch.requests:
             if req.status == RequestStatus.FINISHED:
