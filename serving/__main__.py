@@ -277,9 +277,11 @@ def main():
                         help='model weight data type (vLLM-style). When omitted, defaults to the model config\'s '
                         '``torch_dtype`` (falling back to bfloat16). Overrides only take effect if the profiler '
                         'produced matching data under perf/<hw>/<model>/<variant>/tp<N>/')
-    parser.add_argument('--request-routing-policy', type=str, choices=['LOAD', 'RR', 'RAND', 'CUSTOM'], default='LOAD',
+    parser.add_argument('--request-routing-policy', type=str, choices=['LOAD', 'RR', 'RAND', 'AFFINITY', 'INFLIGHT', 'P2C', 'CUSTOM'], default='LOAD',
                         help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
-                        'RR (round-robin), RAND (random), CUSTOM (user-defined)')
+                        'RR (round-robin), RAND (random), AFFINITY (agentic sessions pinned by a hash of session_id), '
+                        'INFLIGHT (fewest router-side in-flight requests, Production Stack PriorityRouter), '
+                        'P2C (power of two choices on in-flight requests, vLLM Router), CUSTOM (user-defined)')
     parser.add_argument('--load-waiting-weight', type=int, default=4,
                         help='LOAD routing score is waiting * weight + running; 4 matches vLLM\'s DP load balancer')
     parser.add_argument('--expert-routing-policy', type=str,

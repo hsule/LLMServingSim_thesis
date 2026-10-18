@@ -1,4 +1,5 @@
 import bisect
+import hashlib
 import json
 import random
 from .logger import get_logger
@@ -27,6 +28,12 @@ class Router:
         self.prefill_rr_counter = 0
         self.decode_rr_counter = 0
 
+        # Router-side in-flight count per prefill instance: +1 at dispatch, -1 at
+        # completion. INFLIGHT and P2C route on it, as vLLM's routers do (Production
+        # Stack request_stats, vLLM Router's WorkerLoadGuard), not on engine state.
+        self._inflight = [0] * self.prefill_instances
+        self._req_instance = {}           # request_id -> instance index, while in flight
+
         # Pending requests (loaded but not yet routed)
         self._pending_requests = []
         self._pending_idx = 0
@@ -44,11 +51,19 @@ class Router:
             self._select_instance = self._rand_select
         elif self.routing_policy == "LOAD":
             self._select_instance = self._least_load_select
+        elif self.routing_policy == "AFFINITY":
+            self._select_instance = self._affinity_select
+        elif self.routing_policy == "INFLIGHT":
+            self._select_instance = self._inflight_select
+        elif self.routing_policy == "P2C":
+            self._select_instance = self._p2c_select
         elif self.routing_policy == "CUSTOM":
             self._select_instance = self._custom_select
         else:
             raise ValueError(f"Unknown routing_policy '{routing_policy}'. "
-                             "Supported: RR, RAND, LOAD, CUSTOM")
+                             "Supported: RR, RAND, LOAD, AFFINITY, INFLIGHT, P2C, CUSTOM")
+        if self.routing_policy in ("INFLIGHT", "P2C") and self.decode_instances:
+            raise ValueError(f"{self.routing_policy} routing does not support P/D disaggregation")
         self.logger = get_logger(self.__class__)
 
     # -----------------------------------------------------------------------
@@ -94,6 +109,34 @@ class Router:
                 best_idx = idx
         self._set_counter(role, (best_idx + 1) % num_instances)
         return best_idx
+
+    def _affinity_select(self, schedulers, role, req_data=None):
+        """Session affinity: every sub-request of a session goes to the replica
+        fixed by a stable hash of its session_id. SHA-1, not hash(), which is
+        salted per process and would make a replay irreproducible."""
+        if req_data is None or 'session_id' not in req_data:
+            raise ValueError("AFFINITY routing needs agentic sessions (a session_id "
+                             "per request); flat requests and P/D transfer are not supported")
+        digest = hashlib.sha1(str(req_data['session_id']).encode("utf-8")).hexdigest()
+        return int(digest[:12], 16) % len(schedulers)
+
+    def _inflight_select(self, schedulers, role):
+        """Fewest requests in flight, ties to the lowest index. Production Stack's
+        PriorityRouter high-priority branch (min over endpoints of in_prefill +
+        in_decoding requests)."""
+        return min(range(len(schedulers)), key=lambda i: self._inflight[i])
+
+    def _p2c_select(self, schedulers, role):
+        """vLLM Router's power_of_two: two distinct random candidates (idx2 is
+        redrawn until it differs), the less loaded wins, a tie goes to the first."""
+        n = len(schedulers)
+        if n == 1:
+            return 0
+        idx1 = self._rnd.randrange(n)
+        idx2 = self._rnd.randrange(n)
+        while idx2 == idx1:
+            idx2 = self._rnd.randrange(n)
+        return idx1 if self._inflight[idx1] <= self._inflight[idx2] else idx2
 
     def _custom_select(self, schedulers, role):
         raise NotImplementedError("Implement custom routing policy.")
@@ -200,8 +243,13 @@ class Router:
             if req_data['arrival_time_ns'] > current_time_ns:
                 break
 
-            instance_id = self._select_instance(self.prefill_schedulers, "prefill")
+            if self.routing_policy == "AFFINITY":
+                instance_id = self._affinity_select(self.prefill_schedulers, "prefill", req_data)
+            else:
+                instance_id = self._select_instance(self.prefill_schedulers, "prefill")
             sched = self.prefill_schedulers[instance_id]
+            self._inflight[instance_id] += 1
+            self._req_instance[req_data['index']] = instance_id
 
             if sched.enable_prefix_caching:
                 sched.add_request([
@@ -240,8 +288,12 @@ class Router:
         """Called when a request finishes. Releases the next sub-request in
         the session chain after the tool_call duration elapses.
 
-        For flat requests (not in a session), this is a no-op.
+        Also releases the request's slot in the router-side in-flight count.
+        For flat requests (not in a session), that is all it does.
         """
+        inst = self._req_instance.pop(request_id, None)
+        if inst is not None:
+            self._inflight[inst] -= 1
         session_info = self._request_to_session.pop(request_id, None)
         if session_info is None:
             return
