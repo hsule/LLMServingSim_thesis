@@ -62,6 +62,11 @@ def _pad_batch_to_max(batch, max_len):
     batch.num_decode += pad              # counted for lm_head / dense shape
 
 
+# ASTRA-Sim's opt-in arrival wake-up (ASTRA_ARRIVAL_WAKEUP=1, network_frontend main.cc). The frontend
+# only needs it to keep a due request from waiting behind a future wake-up; see _pass_response.
+_ARRIVAL_WAKEUP = os.environ.get("ASTRA_ARRIVAL_WAKEUP") == "1"
+
+
 def _pass_response(router, current, state_changed=False):
     """The "pass" answer, carrying the next known arrival when there is one.
 
@@ -84,8 +89,14 @@ def _pass_response(router, current, state_changed=False):
     if state_changed:
         return "pass -1"
     nxt = router.get_next_pending_arrival()
-    if nxt is None or nxt <= current:
+    if nxt is None:
         return "pass"
+    if nxt <= current:
+        # A request is already due but was not routed in this ask: an agentic sub-request released
+        # by this very report with zero tool time. Under the opt-in arrival wake-up the event queue
+        # holds future wake-ups, so the empty-queue re-ask that picks it up without a deadline never
+        # comes; ask again one tick later instead.
+        return f"pass {int(current) + 1}" if _ARRIVAL_WAKEUP else "pass"
     return f"pass {int(nxt)}"
 
 
