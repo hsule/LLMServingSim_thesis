@@ -68,6 +68,11 @@ def _pad_batch_to_max(batch, max_len):
 _ARRIVAL_WAKEUP = os.environ.get("ASTRA_ARRIVAL_WAKEUP") == "1"
 
 
+def _partial_path(output_file):
+    """Where --slo-truncate writes the rows of a stopped run: never the output CSV's own name."""
+    return (output_file[:-4] if output_file.endswith(".csv") else output_file) + ".partial.csv"
+
+
 def _pass_response(router, current, state_changed=False):
     """The "pass" answer, carrying the next known arrival when there is one.
 
@@ -298,19 +303,12 @@ def main():
                         help='LOAD routing score is waiting * weight + running; 4 matches vLLM\'s DP load balancer')
     parser.add_argument('--slo-truncate', type=str, default=None,
                         help='stop the run as soon as its p99 SLO verdict is certainly infeasible, e.g. '
-                        '"TTFT=5" or "TTFT=2,latency=30" (seconds). Writes <output>.truncated.json and a partial '
-                        'output CSV. Needs --output. Off by default')
-    parser.add_argument('--slo-window', type=str, default="30,270",
-                        help='measurement window for --slo-truncate as "warmup,window" in seconds after t0')
-    parser.add_argument('--slo-t0-ns', type=int, default=None,
-                        help='t0 for --slo-truncate (default: this run\'s first arrival). A part of a split trace '
-                        'passes the whole trace\'s first arrival')
-    parser.add_argument('--slo-total-requests', type=int, default=None,
-                        help='requests of the whole trace for --slo-truncate (default: this run\'s own)')
-    parser.add_argument('--slo-prior', type=str, default=None,
-                        help='violations already established for the window by other parts, e.g. "TTFT=3"')
-    parser.add_argument('--slo-margin', type=float, default=0.0,
-                        help='seconds added to every SLO when counting violations (timing tolerance of a part)')
+                        '"TTFT=5" or "TTFT=2,latency=30" (seconds; metrics TTFT and latency). Writes '
+                        '<output>.truncated.json and <output>.partial.csv instead of the output CSV. Needs '
+                        '--output and --slo-window. Single runs only, not parts of a split trace. Off by default')
+    parser.add_argument('--slo-window', type=str, default=None,
+                        help='measurement window for --slo-truncate as "warmup,window" in seconds after the first '
+                        'arrival; must be the window the analysis uses')
     parser.add_argument('--expert-routing-policy', type=str,
                         choices=['BALANCED', 'RR', 'RAND', 'CUSTOM'],
                         default='BALANCED',
@@ -609,18 +607,24 @@ def main():
         if args.slo_truncate:
             if output_file is None:
                 raise ValueError("--slo-truncate needs --output")
+            if args.slo_window is None:
+                raise ValueError("--slo-truncate needs --slo-window (the analysis's warmup,window)")
             if any(inst.get("dp_group") is not None for inst in instances):
                 raise ValueError("--slo-truncate does not support DP groups (dummy batches)")
-            kv = lambda spec: {k: float(v) for k, v in (x.split("=") for x in spec.split(","))} if spec else {}
+            slo = {k: float(v) for k, v in (x.split("=") for x in args.slo_truncate.split(","))}
+            if args.skip_prefill and "TTFT" in slo:
+                raise ValueError("--slo-truncate TTFT needs prefill: --skip-prefill records no first token")
             warm, win = (float(x) for x in args.slo_window.split(","))
             own_total = len(router._pending_requests) + sum(
                 len(sess['sub_requests']) - sess['next_index'] for sess in router._deferred_sessions.values())
+            if own_total == 0:
+                raise ValueError("--slo-truncate needs requests")
+            out = output_file if os.path.isabs(output_file) else f"../{output_file}"
+            for stale in (out + ".truncated.json", _partial_path(out)):
+                if os.path.exists(stale):
+                    os.remove(stale)        # left by an earlier run at this path; it would be misread
             slo_truncate.install(slo_truncate.SloTruncator(
-                kv(args.slo_truncate), warm, win,
-                args.slo_t0_ns if args.slo_t0_ns is not None
-                else min(r['arrival_time_ns'] for r in router._pending_requests),
-                args.slo_total_requests if args.slo_total_requests is not None else own_total,
-                prior={k: int(v) for k, v in kv(args.slo_prior).items()}, margin_s=args.slo_margin))
+                slo, warm, win, min(r['arrival_time_ns'] for r in router._pending_requests), own_total))
     else:
         # Manually adding request (legacy: route all upfront)
         for i in range(16):
@@ -755,12 +759,15 @@ def main():
         # --slo-truncate: stop once the SLO verdict is certainly infeasible (serving/core/slo_truncate.py)
         trunc = slo_truncate.active()
         if trunc is not None and trunc.check(current):
-            trunc.write((output_file if os.path.isabs(output_file) else f"../{output_file}") + ".truncated.json")
+            out = output_file if os.path.isabs(output_file) else f"../{output_file}"
             print_markup(f"[sim.heading]▶ SLO truncation[/]: {trunc.fired['metric']} violations "
-                         f"{trunc.fired['violations'] + trunc.fired['prior']} >= {trunc.fired['threshold']} "
+                         f"{trunc.fired['violations']} >= {trunc.fired['threshold']} "
                          f"at {current / 1e9:.3f} s; the run is infeasible, stopping")
             for i in range(num_instances):
-                schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
+                schedulers[i].save_output(_partial_path(output_file), is_append=False if i == 0 else True)
+            if os.path.exists(out):
+                os.remove(out)              # an earlier run's complete CSV must not stand in for this one
+            trunc.write(out + ".truncated.json")
             p.kill(); p.wait()
             if not (args.keep_inputs or args.save_trace_text):
                 _cleanup_inputs_root(run_paths, logger)
