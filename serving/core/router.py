@@ -2,7 +2,19 @@ import bisect
 import hashlib
 import json
 import random
+from collections import deque
 from .logger import get_logger
+from .scheduler import _event
+
+# Policies that read the request (its session_id, prompt length, priority) or the
+# arrival time, not just the instances. AFFINITY predates the list and keeps its own call.
+_REQUEST_AWARE = ("P2C3", "INFLIGHT_TOK", "INFLIGHT_LAG", "PRIORITY", "HASHRING_QPS", "HASH_LOAD")
+_COUPLED = ("INFLIGHT", "P2C", "P2C3", "INFLIGHT_TOK", "INFLIGHT_LAG", "PRIORITY", "HASHRING_QPS", "HASH_LOAD")
+
+
+def _key_hash(key):
+    """Stable 48-bit hash: SHA-1, not hash(), which is salted per process."""
+    return int(hashlib.sha1(str(key).encode("utf-8")).hexdigest()[:12], 16)
 
 
 class Router:
@@ -12,7 +24,12 @@ class Router:
             schedulers, req_num,
             routing_policy="RR",
             seed=42,
-            load_waiting_weight=4
+            load_waiting_weight=4,
+            stats_interval_ns=100_000_000,
+            qps_window_ns=1_000_000_000,
+            hash_vnodes=100,
+            load_threshold=16,
+            priority_threshold=1
     ):
         self.schedulers = schedulers
         self.num_instances = num_instances
@@ -33,6 +50,20 @@ class Router:
         # Stack request_stats, vLLM Router's WorkerLoadGuard), not on engine state.
         self._inflight = [0] * self.prefill_instances
         self._req_instance = {}           # request_id -> instance index, while in flight
+
+        # State of the request-aware policies (see their docstrings)
+        self.stats_interval_ns = stats_interval_ns
+        self.qps_window_ns = qps_window_ns
+        self.load_threshold = load_threshold
+        self.priority_threshold = priority_threshold
+        self._inflight_tok = [0] * self.prefill_instances      # INFLIGHT_TOK
+        self._req_tokens = {}                                    # request_id -> prompt tokens, while in flight
+        self._dispatched = [0] * self.prefill_instances         # INFLIGHT_LAG: dispatches, live
+        self._completions = [deque() for _ in range(self.prefill_instances)]   # completion times not yet seen
+        self._completed_seen = [0] * self.prefill_instances     # completions visible to INFLIGHT_LAG
+        self._recent = [deque() for _ in range(self.prefill_instances)]        # HASHRING_QPS: arrivals routed
+        self._ring = sorted((_key_hash(f"{i}-{v}"), i)
+                            for i in range(self.prefill_instances) for v in range(hash_vnodes))
 
         # Pending requests (loaded but not yet routed)
         self._pending_requests = []
@@ -57,12 +88,25 @@ class Router:
             self._select_instance = self._inflight_select
         elif self.routing_policy == "P2C":
             self._select_instance = self._p2c_select
+        elif self.routing_policy == "P2C3":
+            self._select_instance = self._p2c3_select
+        elif self.routing_policy == "INFLIGHT_TOK":
+            self._select_instance = self._inflight_tok_select
+        elif self.routing_policy == "INFLIGHT_LAG":
+            self._select_instance = self._inflight_lag_select
+        elif self.routing_policy == "PRIORITY":
+            self._select_instance = self._priority_select
+        elif self.routing_policy == "HASHRING_QPS":
+            self._select_instance = self._hashring_qps_select
+        elif self.routing_policy == "HASH_LOAD":
+            self._select_instance = self._hash_load_select
         elif self.routing_policy == "CUSTOM":
             self._select_instance = self._custom_select
         else:
             raise ValueError(f"Unknown routing_policy '{routing_policy}'. "
-                             "Supported: RR, RAND, LOAD, AFFINITY, INFLIGHT, P2C, CUSTOM")
-        if self.routing_policy in ("INFLIGHT", "P2C") and self.decode_instances:
+                             "Supported: RR, RAND, LOAD, AFFINITY, INFLIGHT, P2C, P2C3, INFLIGHT_TOK, "
+                             "INFLIGHT_LAG, PRIORITY, HASHRING_QPS, HASH_LOAD, CUSTOM")
+        if self.routing_policy in _COUPLED and self.decode_instances:
             raise ValueError(f"{self.routing_policy} routing does not support P/D disaggregation")
         self.logger = get_logger(self.__class__)
 
@@ -138,6 +182,76 @@ class Router:
             idx2 = self._rnd.randrange(n)
         return idx1 if self._inflight[idx1] <= self._inflight[idx2] else idx2
 
+    def _p2c3_select(self, schedulers, role, req_data, now):
+        """Power of three choices: three distinct random candidates, each redrawn
+        until it differs from the earlier ones; fewest in flight wins, a tie goes
+        to the earliest drawn."""
+        n = len(schedulers)
+        if n <= 3:
+            cands = list(range(n))
+        else:
+            cands = []
+            while len(cands) < 3:
+                c = self._rnd.randrange(n)
+                if c not in cands:
+                    cands.append(c)
+        return min(cands, key=lambda i: self._inflight[i])
+
+    def _inflight_tok_select(self, schedulers, role, req_data, now):
+        """Fewest prompt tokens in flight (the sum of input_toks over the requests
+        dispatched and not yet completed), ties to the lowest index."""
+        return min(range(len(schedulers)), key=lambda i: self._inflight_tok[i])
+
+    def _inflight_lag_select(self, schedulers, role, req_data, now):
+        """Fewest requests in flight as the router sees them: its own dispatches at
+        once, completions only from a stats poll every stats_interval_ns (those
+        that completed at or before the last poll boundary <= now). Ties to the
+        lowest index."""
+        boundary = now - now % self.stats_interval_ns
+        for i, q in enumerate(self._completions):
+            while q and q[0] <= boundary:
+                q.popleft()
+                self._completed_seen[i] += 1
+        return min(range(len(schedulers)), key=lambda i: self._dispatched[i] - self._completed_seen[i])
+
+    def _priority_select(self, schedulers, role, req_data, now):
+        """Per-request priority (lower is more urgent, vLLM's convention). Below
+        priority_threshold: fewest in flight, ties to the lowest index. Otherwise:
+        round robin over all instances, with a counter only these requests advance."""
+        if 'priority' not in req_data:
+            raise ValueError("PRIORITY routing needs a 'priority' field on every request")
+        if req_data['priority'] < self.priority_threshold:
+            return min(range(len(schedulers)), key=lambda i: self._inflight[i])
+        return self._rr_select(schedulers, role)
+
+    def _hashring_qps_select(self, schedulers, role, req_data, now):
+        """Consistent hash ring on the session id (hash_vnodes virtual nodes per
+        instance, the first ring point at or after the key's hash, wrapping). A
+        request without a session id goes to the instance that received the fewest
+        requests whose arrival lies in the last qps_window_ns before its own
+        arrival, ties to the lowest index. Every routed request counts there."""
+        arrival = req_data['arrival_time_ns']
+        for q in self._recent:
+            while q and q[0] <= arrival - self.qps_window_ns:
+                q.popleft()
+        if 'session_id' in req_data:
+            k = bisect.bisect_left(self._ring, (_key_hash(req_data['session_id']), -1))
+            idx = self._ring[k % len(self._ring)][1]
+        else:
+            idx = min(range(len(schedulers)), key=lambda i: len(self._recent[i]))
+        self._recent[idx].append(arrival)
+        return idx
+
+    def _hash_load_select(self, schedulers, role, req_data, now):
+        """Hash the session id (or the request id when there is none) to an
+        instance; keep it while it has fewer than load_threshold requests in
+        flight, otherwise take the instance with the fewest, ties to the lowest index."""
+        key = req_data.get('session_id', req_data['index'])
+        idx = _key_hash(key) % len(schedulers)
+        if self._inflight[idx] < self.load_threshold:
+            return idx
+        return min(range(len(schedulers)), key=lambda i: self._inflight[i])
+
     def _custom_select(self, schedulers, role):
         raise NotImplementedError("Implement custom routing policy.")
 
@@ -191,6 +305,8 @@ class Router:
             'output_toks': int(row['input_toks'] + row['output_toks']),
             'arrival_time_ns': int(row['arrival_time_ns']),
         }
+        if 'priority' in row:
+            req_data['priority'] = int(row['priority'])
         if enable_prefix_caching:
             req_data['input_hash_ids'] = row.get('input_tok_ids', [])
             req_data['output_hash_ids'] = row.get('output_tok_ids', [])
@@ -211,6 +327,7 @@ class Router:
             'sub_requests': sub_reqs,
             'next_index': 1,  # index 0 is being queued now
             'id_base': base_id,
+            'priority': row.get('priority'),
         }
 
         # Queue the first sub-request
@@ -223,6 +340,8 @@ class Router:
             'session_id': session_id,
             'sub_request_index': 0,
         }
+        if row.get('priority') is not None:
+            req_data['priority'] = int(row['priority'])
         if enable_prefix_caching:
             req_data['input_hash_ids'] = first.get('input_tok_ids', [])
             req_data['output_hash_ids'] = first.get('output_tok_ids', [])
@@ -238,6 +357,7 @@ class Router:
         Returns the number of newly routed requests.
         """
         routed = 0
+        now = int(current_time_ns) if current_time_ns != float('inf') else -1   # -1: legacy upfront routing
         while self._pending_idx < len(self._pending_requests):
             req_data = self._pending_requests[self._pending_idx]
             if req_data['arrival_time_ns'] > current_time_ns:
@@ -245,11 +365,18 @@ class Router:
 
             if self.routing_policy == "AFFINITY":
                 instance_id = self._affinity_select(self.prefill_schedulers, "prefill", req_data)
+            elif self.routing_policy in _REQUEST_AWARE:
+                instance_id = self._select_instance(self.prefill_schedulers, "prefill", req_data, now)
             else:
                 instance_id = self._select_instance(self.prefill_schedulers, "prefill")
             sched = self.prefill_schedulers[instance_id]
             self._inflight[instance_id] += 1
+            self._inflight_tok[instance_id] += req_data['input_toks']
+            self._dispatched[instance_id] += 1
             self._req_instance[req_data['index']] = instance_id
+            self._req_tokens[req_data['index']] = req_data['input_toks']
+            _event({"ev": "route", "inst": instance_id, "req": req_data['index'],
+                    "arr": req_data['arrival_time_ns'], "t": now})
 
             if sched.enable_prefix_caching:
                 sched.add_request([
@@ -294,6 +421,9 @@ class Router:
         inst = self._req_instance.pop(request_id, None)
         if inst is not None:
             self._inflight[inst] -= 1
+            self._inflight_tok[inst] -= self._req_tokens.pop(request_id)
+            if self.routing_policy == "INFLIGHT_LAG":
+                self._completions[inst].append(completion_time_ns)
         session_info = self._request_to_session.pop(request_id, None)
         if session_info is None:
             return
@@ -322,6 +452,8 @@ class Router:
                 'session_id': session_id,
                 'sub_request_index': next_idx,
             }
+            if session['priority'] is not None:
+                req_data['priority'] = int(session['priority'])
             if self._enable_prefix_caching:
                 req_data['input_hash_ids'] = next_sub.get('input_tok_ids', [])
                 req_data['output_hash_ids'] = next_sub.get('output_tok_ids', [])

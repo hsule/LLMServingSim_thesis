@@ -294,13 +294,29 @@ def main():
                         help='model weight data type (vLLM-style). When omitted, defaults to the model config\'s '
                         '``torch_dtype`` (falling back to bfloat16). Overrides only take effect if the profiler '
                         'produced matching data under perf/<hw>/<model>/<variant>/tp<N>/')
-    parser.add_argument('--request-routing-policy', type=str, choices=['LOAD', 'RR', 'RAND', 'AFFINITY', 'INFLIGHT', 'P2C', 'CUSTOM'], default='LOAD',
+    parser.add_argument('--request-routing-policy', type=str, choices=['LOAD', 'RR', 'RAND', 'AFFINITY', 'INFLIGHT', 'P2C', 'P2C3', 'INFLIGHT_TOK',
+                                 'INFLIGHT_LAG', 'PRIORITY', 'HASHRING_QPS', 'HASH_LOAD', 'CUSTOM'], default='LOAD',
                         help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
                         'RR (round-robin), RAND (random), AFFINITY (agentic sessions pinned by a hash of session_id), '
                         'INFLIGHT (fewest router-side in-flight requests, Production Stack PriorityRouter), '
-                        'P2C (power of two choices on in-flight requests, vLLM Router), CUSTOM (user-defined)')
+                        'P2C (power of two choices on in-flight requests, vLLM Router), P2C3 (three choices), '
+                        'INFLIGHT_TOK (fewest prompt tokens in flight), INFLIGHT_LAG (in flight, completions seen at '
+                        'a polling interval), PRIORITY (urgent requests least-loaded, the rest round robin), '
+                        'HASHRING_QPS (consistent hash on session_id, fewest recent arrivals without one), '
+                        'HASH_LOAD (hash on session_id unless that instance is loaded), CUSTOM (user-defined)')
     parser.add_argument('--load-waiting-weight', type=int, default=4,
                         help='LOAD routing score is waiting * weight + running; 4 matches vLLM\'s DP load balancer')
+    parser.add_argument('--routing-stats-interval-ms', type=float, default=100.0,
+                        help='INFLIGHT_LAG: completions become visible to the router at this polling interval')
+    parser.add_argument('--routing-qps-window-ms', type=float, default=1000.0,
+                        help='HASHRING_QPS: window over which requests without a session id count recent arrivals')
+    parser.add_argument('--routing-hash-vnodes', type=int, default=100,
+                        help='HASHRING_QPS: virtual nodes per instance on the hash ring')
+    parser.add_argument('--routing-load-threshold', type=int, default=16,
+                        help='HASH_LOAD: keep the hashed instance while it has fewer requests in flight than this')
+    parser.add_argument('--routing-priority-threshold', type=int, default=1,
+                        help='PRIORITY: requests with priority below this go to the least-loaded instance, '
+                        'the rest round robin')
     parser.add_argument('--slo-truncate', type=str, default=None,
                         help='stop the run as soon as its p99 SLO verdict is certainly infeasible, e.g. '
                         '"TTFT=5" or "TTFT=2,latency=30" (seconds; metrics TTFT and latency). Writes '
@@ -595,7 +611,12 @@ def main():
     controller = Controller(total_npu)
     # Global Request Router
     router = Router(num_instances, schedulers, num_req, request_routing_policy,
-                    load_waiting_weight=load_waiting_weight)
+                    load_waiting_weight=load_waiting_weight,
+                    stats_interval_ns=int(round(args.routing_stats_interval_ms * 1e6)),
+                    qps_window_ns=int(round(args.routing_qps_window_ms * 1e6)),
+                    hash_vnodes=args.routing_hash_vnodes,
+                    load_threshold=args.routing_load_threshold,
+                    priority_threshold=args.routing_priority_threshold)
     # Power Modeling if enabled
     if power_modeling:
         power_model = PowerModel(power_configs)
